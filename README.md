@@ -59,3 +59,8 @@ uv run main.py --run my_run --checkpoint_every 100
 # resume from checkpoint
 uv run main.py --run my_run --resume checkpoint_step_100.pt
 ```
+
+### Validation (optional)
+```bash
+uv run main.py --run my_run --val_ratio 0.05 --val_every 50
+```
