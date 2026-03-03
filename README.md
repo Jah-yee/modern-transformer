@@ -64,3 +64,13 @@ uv run main.py --run my_run --resume checkpoint_step_100.pt
 ```bash
 uv run main.py --run my_run --val_ratio 0.05 --val_every 50
 ```
+
+### Count params
+```bash
+uv run main.py --mode count_params
+```
+
+### Inference
+```bash
+uv run main.py --mode inference --checkpoint path/to/checkpoint_step_N.pt
+```

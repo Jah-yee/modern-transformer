@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument("--qk_norm", action="store_true", help="Apply RMSNorm to Q/K in attention (LLaMA-style)")
     parser.add_argument("--val_ratio", type=float, default=0.0, help="Fraction of data for validation (0 = disabled)")
     parser.add_argument("--val_every", type=int, default=None, help="Run validation every N optimizer steps (default: disabled)")
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "count_params", "inference"], help="Mode: train, count_params, or inference")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (required for inference)")
     return parser.parse_args()
 
 
@@ -537,7 +539,8 @@ def count_params(config):
     dummy_input = torch.randint(0, config.vocab_size, (4, config.context_len)).to(config.device)
     torchinfo.summary(model, input_data=dummy_input, verbose=1)
 
-def inference(model, config):
+def inference(model, config, num_new_tokens=20):
+    """Run greedy decoding from fixed prefixes."""
     prefixes = [
         "What is",
         "How to",
@@ -550,10 +553,17 @@ def inference(model, config):
         "What is the purpose of",
         "What is the best way to"
     ]
-    tokenized_prefixes = [config.tokenizer.encode(p) for p in prefixes]
-
-    for i in tokenized_prefixes:
-        print(i + " " + config.tokenizer.decode(model(i)))
+    model.eval()
+    with torch.no_grad():
+        for prefix in prefixes:
+            ids = config.tokenizer.encode(prefix)
+            x = torch.tensor([ids], dtype=torch.long, device=config.device)
+            for _ in range(num_new_tokens):
+                logits = model(x)
+                next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+                x = torch.cat([x, next_id], dim=1)
+            text = config.tokenizer.decode(x[0].tolist())
+            print(prefix + " -> " + text)
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -572,10 +582,20 @@ if __name__ == "__main__":
     if args.seed is not None:
         set_seed(args.seed)
     config = Config(args)
-    training(
-        config,
-        run_name=args.run,
-        no_wandb=args.no_wandb,
-        wandb_project=args.wandb_project,
-        wandb_entity=args.wandb_entity,
-    )
+    if args.mode == "train":
+        training(
+            config,
+            run_name=args.run,
+            no_wandb=args.no_wandb,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+        )
+    elif args.mode == "count_params":
+        count_params(config)
+    elif args.mode == "inference":
+        if not args.checkpoint:
+            sys.exit("--checkpoint is required for inference")
+        model = Transformer(config).to(config.device)
+        ckpt = torch.load(args.checkpoint, map_location=config.device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        inference(model, config)
