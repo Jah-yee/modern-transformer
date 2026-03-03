@@ -85,3 +85,8 @@ uv run main.py --run my_run --preset small   # 6 layers, 768d, 12 heads
 ```bash
 uv sync --extra dev && uv run pytest tests/ -v
 ```
+
+### Options
+- `--grad_norm 1.0` to enable gradient clipping
+- `--qk_norm` for LLaMA-style QK RMSNorm
+- `--use_flash2` to use Flash Attention 2 on CUDA

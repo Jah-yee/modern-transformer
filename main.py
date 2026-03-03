@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="train", choices=["train", "count_params", "inference"], help="Mode: train, count_params, or inference")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (required for inference)")
     parser.add_argument("--use_flash2", action="store_true", help="Use Flash Attention 2 backend for SDPA when available (CUDA)")
+    parser.add_argument("--preset", type=str, default=None, choices=["tiny", "small", "base"], help="Architecture preset: tiny (2L), small (6L), base (12L); all 768d, 12 heads")
     return parser.parse_args()
 
 
@@ -63,6 +64,8 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,) ->
     return torch.cat((o1, o2), dim=-1)
 
 class RotaryEmbedding(nn.Module):
+    """RoPE with optional NTK-aware scaling for longer context."""
+
     def __init__(
         self,
         head_dim: int,
@@ -150,7 +153,7 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 class Config:
-    """Training and model config; overrides from CLI args when args is provided."""
+    """Training and model config; overrides from CLI args when provided."""
 
     def __init__(self, args=None):
         # ----------------------------
@@ -217,6 +220,12 @@ class Config:
         self.val_every = None
 
         if args is not None:
+            preset = getattr(args, "preset", None)
+            if preset is not None:
+                PRESETS = {"tiny": (2, 768, 12), "small": (6, 768, 12), "base": (12, 768, 12)}
+                self.num_blocks, self.embed_dim, self.num_heads = PRESETS[preset]
+                self.attention_dim = self.embed_dim // self.num_heads
+                self.ffn_dim = int(2 * self.embed_dim / 3)
             self.data_path = getattr(args, "data", self.data_path)
             self.batch_size = getattr(args, "batch_size", self.batch_size)
             self.context_len = getattr(args, "context_len", self.context_len)
@@ -244,6 +253,8 @@ class Config:
         pass
 
 class Attention(nn.Module):
+    """Multi-head attention with RoPE, optional QK norm, and per-head temperature (log_tau)."""
+
     def __init__(self, config):
         super().__init__()
 
@@ -313,6 +324,8 @@ class Attention(nn.Module):
         return final_out
 
 class TransformerBlock(nn.Module):
+    """Pre-norm block: RMSNorm -> Attention -> residual, RMSNorm -> FFN -> residual."""
+
     def __init__(self, config):
         super().__init__()
 
@@ -329,6 +342,8 @@ class TransformerBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
+    """Decoder-only transformer with tied input/output embeddings."""
+
     def __init__(self, config):
         super().__init__()
 
@@ -358,6 +373,8 @@ class Transformer(nn.Module):
         return logits
 
 class FFN(nn.Module):
+    """SwiGLU feed-forward: gate(x) * up(x) -> down."""
+
     def __init__(self, config):
         super().__init__()
 
@@ -378,6 +395,8 @@ class FFN(nn.Module):
         return self.out(gate_output * data_output)
 
 class TinyShakespeare(Dataset):
+    """Sliding-window next-token dataset from a text file."""
+
     def __init__(self, file, tokenizer, context_len: int):
         with open(file, 'r') as f:
             text = f.read()
