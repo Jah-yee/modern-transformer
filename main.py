@@ -41,6 +41,8 @@ def parse_args():
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--checkpoint_every", type=int, default=None, help="Save checkpoint every N optimizer steps (default: disabled)")
+    parser.add_argument("--grad_norm", type=float, default=None, help="Gradient norm clipping value (default: disabled)")
+    parser.add_argument("--qk_norm", action="store_true", help="Apply RMSNorm to Q/K in attention (LLaMA-style)")
     return parser.parse_args()
 
 
@@ -213,6 +215,10 @@ class Config:
             self.max_batches = getattr(args, "max_batches", self.max_batches)
             self.checkpoint_every = getattr(args, "checkpoint_every", None)
             self.resume = getattr(args, "resume", None)
+            if getattr(args, "grad_norm", None) is not None:
+                self.grad_norm = True
+                self.grad_norm_value = args.grad_norm
+            self.qk_norm = getattr(args, "qk_norm", False)
             assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
             self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
@@ -242,6 +248,8 @@ class Attention(nn.Module):
   
         self.log_tau = nn.Parameter(torch.zeros(self.num_heads, dtype=config.dtype))
 
+        self.qk_norm = getattr(config, "qk_norm", False)
+        self.qk_norm_layer = nn.RMSNorm(self.attention_dim, eps=1e-6) if self.qk_norm else None
         self.rope = RotaryEmbedding(
             head_dim=self.attention_dim,
             base=config.rope_theta,
@@ -270,6 +278,13 @@ class Attention(nn.Module):
         queries = einops.rearrange(queries, "seq_len (batch num_heads) head_dim -> batch num_heads seq_len head_dim", batch=batch_size)
         keys = einops.rearrange(keys, "seq_len (batch num_heads) head_dim -> batch num_heads seq_len head_dim", batch=batch_size)
         values = einops.rearrange(values, "batch seq_len num_heads head_dim -> batch num_heads seq_len head_dim")
+
+        if self.qk_norm_layer is not None:
+            queries = self.qk_norm_layer(queries)
+            keys = self.qk_norm_layer(keys)
+        scale = torch.exp(-self.log_tau / 2).view(1, -1, 1, 1)
+        queries = queries * scale.to(queries.dtype)
+        keys = keys * scale.to(keys.dtype)
 
         attention = F.scaled_dot_product_attention(
             queries, keys, values,
@@ -442,6 +457,8 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
 
             loss.backward()
             if (batch_idx + 1) % config.accum_steps == 0:
+                if getattr(config, "grad_norm", False):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_value)
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
