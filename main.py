@@ -48,6 +48,7 @@ def parse_args():
     parser.add_argument("--mode", type=str, default="train", choices=["train", "count_params", "inference"], help="Mode: train, count_params, or inference")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (required for inference)")
     parser.add_argument("--use_flash2", action="store_true", help="Use Flash Attention 2 backend for SDPA when available (CUDA)")
+    parser.add_argument("--preset", type=str, default=None, choices=["tiny", "small", "base"], help="Architecture preset: tiny (2L), small (6L), base (12L); all 768d, 12 heads")
     return parser.parse_args()
 
 
@@ -217,6 +218,12 @@ class Config:
         self.val_every = None
 
         if args is not None:
+            preset = getattr(args, "preset", None)
+            if preset is not None:
+                PRESETS = {"tiny": (2, 768, 12), "small": (6, 768, 12), "base": (12, 768, 12)}
+                self.num_blocks, self.embed_dim, self.num_heads = PRESETS[preset]
+                self.attention_dim = self.embed_dim // self.num_heads
+                self.ffn_dim = int(2 * self.embed_dim / 3)
             self.data_path = getattr(args, "data", self.data_path)
             self.batch_size = getattr(args, "batch_size", self.batch_size)
             self.context_len = getattr(args, "context_len", self.context_len)
