@@ -371,7 +371,7 @@ def training(config, run_name):
     model = Transformer(config).to(config.device)
     model = torch.compile(model, mode="default") # modes are `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`
     if config.world_size > 1:
-        model = DDP(model, device_ids=[config.local_rank] if torch.cuda_is_available() else None)
+        model = DDP(model, device_ids=[config.local_rank] if torch.cuda.is_available() else None)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_batches)

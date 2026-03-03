@@ -35,7 +35,7 @@ uv sync
 
 ### Logging
 ```bash
-wanbd login
+wandb login
 # set your weights & biases account project and entity name in main.py and your api key in a .env file.
 ```
 
