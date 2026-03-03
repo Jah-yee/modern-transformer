@@ -13,3 +13,7 @@ dependencies = [
     "torchinfo>=1.8.0",
     "wandb>=0.22.0",
 ]
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]

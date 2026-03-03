@@ -74,3 +74,14 @@ uv run main.py --mode count_params
 ```bash
 uv run main.py --mode inference --checkpoint path/to/checkpoint_step_N.pt
 ```
+
+### Presets
+```bash
+uv run main.py --run my_run --preset small   # 6 layers, 768d, 12 heads
+# preset: tiny (2L), small (6L), base (12L)
+```
+
+### Testing
+```bash
+uv sync --extra dev && uv run pytest tests/ -v
+```
