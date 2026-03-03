@@ -1,4 +1,5 @@
 import argparse
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +39,8 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default=None, help="W&B project (overrides env)")
     parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (overrides env)")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--checkpoint_every", type=int, default=None, help="Save checkpoint every N optimizer steps (default: disabled)")
     return parser.parse_args()
 
 
@@ -200,12 +203,16 @@ class Config:
         self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size) # accum steps simulates larger batches
         self.max_batches = None
         self.data_path = "data/tiny_shakespeare.txt"
+        self.checkpoint_every = None
+        self.resume = None
 
         if args is not None:
             self.data_path = getattr(args, "data", self.data_path)
             self.batch_size = getattr(args, "batch_size", self.batch_size)
             self.context_len = getattr(args, "context_len", self.context_len)
             self.max_batches = getattr(args, "max_batches", self.max_batches)
+            self.checkpoint_every = getattr(args, "checkpoint_every", None)
+            self.resume = getattr(args, "resume", None)
             assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
             self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
@@ -364,6 +371,10 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
     else:
         rank = 0
 
+    data_dir = os.path.dirname(config.data_path)
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+
     if rank == 0 and not no_wandb:
         wandb.init(
             project=project,
@@ -404,6 +415,19 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_batches)
 
+    opt_step = 0
+    if getattr(config, "resume", None):
+        ckpt = torch.load(config.resume, map_location=config.device, weights_only=True)
+        raw_model = model.module if hasattr(model, "module") else model
+        raw_model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        opt_step = ckpt.get("opt_step", 0)
+        if rank == 0:
+            print(f"Resumed from {config.resume} at opt_step {opt_step}")
+
     total_loss = 0
     training_start_time = time.perf_counter()
     for epoch in range(1):
@@ -417,10 +441,22 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
             total_loss += loss
 
             loss.backward()
-            if (batch_idx+1) % config.accum_steps == 0: # if the batch_idx is a multiple of the accumulation steps do a backprop
+            if (batch_idx + 1) % config.accum_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
+                opt_step += 1
+                if getattr(config, "checkpoint_every", None) and opt_step > 0 and opt_step % config.checkpoint_every == 0 and rank == 0:
+                    raw_model = model.module if hasattr(model, "module") else model
+                    torch.save({
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "opt_step": opt_step,
+                        "epoch": epoch,
+                        "batch_idx": batch_idx,
+                    }, f"checkpoint_step_{opt_step}.pt")
+                    print(f"Saved checkpoint_step_{opt_step}.pt")
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = (x.shape[0] * x.shape[1]) / elapsed # batch size * sequence length = total tokens in batch
@@ -470,8 +506,22 @@ def inference(model, config):
     for i in tokenized_prefixes:
         print(i + " " + config.tokenizer.decode(model(i)))
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     args = parse_args()
+    if args.seed is not None:
+        set_seed(args.seed)
     config = Config(args)
     training(
         config,

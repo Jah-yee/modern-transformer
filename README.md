@@ -47,3 +47,12 @@ uv run main.py --run my_run
 # on GPU:
 uv run torchrun --nproc_per_node=NUM_GPUS main.py --run my_run
 ```
+
+### Checkpoint / Resume
+```bash
+# save checkpoint every 100 optimizer steps
+uv run main.py --run my_run --checkpoint_every 100
+
+# resume from checkpoint
+uv run main.py --run my_run --resume checkpoint_step_100.pt
+```
