@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (required for inference)")
     parser.add_argument("--use_flash2", action="store_true", help="Use Flash Attention 2 backend for SDPA when available (CUDA)")
     parser.add_argument("--preset", type=str, default=None, choices=["tiny", "small", "base"], help="Architecture preset: tiny (2L), small (6L), base (12L); all 768d, 12 heads")
+    parser.add_argument("--position_encoding", type=str, default="rope", choices=["rope", "alibi"], help="Position encoding: rope (default) or alibi")
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine", "linear", "constant"], help="LR scheduler: cosine, linear, or constant")
     return parser.parse_args()
 
 
@@ -193,6 +195,8 @@ class Config:
         self.grad_norm_value = 1.0
         self.qk_norm = False
         self.use_flash2 = False
+        self.position_encoding = "rope"
+        self.scheduler = "cosine"
 
         # ----------------------------
         # data configs
@@ -239,6 +243,8 @@ class Config:
             self.val_ratio = getattr(args, "val_ratio", 0.0) or 0.0
             self.val_every = getattr(args, "val_every", None)
             self.use_flash2 = getattr(args, "use_flash2", False)
+            self.position_encoding = getattr(args, "position_encoding", "rope")
+            self.scheduler = getattr(args, "scheduler", "cosine")
             assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
             self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
@@ -273,6 +279,7 @@ class Attention(nn.Module):
         self.qk_norm = getattr(config, "qk_norm", False)
         self.qk_norm_layer = nn.RMSNorm(self.attention_dim, eps=1e-6) if self.qk_norm else None
         self.use_flash2 = getattr(config, "use_flash2", False)
+        self.position_encoding = getattr(config, "position_encoding", "rope")
         self.rope = RotaryEmbedding(
             head_dim=self.attention_dim,
             base=config.rope_theta,
@@ -282,7 +289,10 @@ class Attention(nn.Module):
             ntk_alpha=config.rope_ntk_alpha,
             ntk_beta=config.rope_ntk_beta,
             device=config.device,
-        )
+        ) if self.position_encoding == "rope" else None
+        n_h = self.num_heads
+        if self.position_encoding == "alibi":
+            self.register_buffer("alibi_slopes", torch.pow(2.0, -torch.arange(1, n_h + 1, dtype=torch.float32) * (8.0 / n_h)))
 
     def forward(self, x):
         batch_size, seq_len = x.shape[0], x.shape[1]
@@ -295,7 +305,8 @@ class Attention(nn.Module):
         keys = einops.rearrange(keys, "batch seq_len (num_heads head_dim) -> seq_len (batch num_heads) head_dim", num_heads=self.num_heads, head_dim=self.attention_dim)
         values = einops.rearrange(values, "batch seq_len (num_heads head_dim) -> batch seq_len num_heads head_dim", num_heads=self.num_heads)
 
-        queries,keys = self.rope(queries, keys)
+        if self.rope is not None:
+            queries, keys = self.rope(queries, keys)
 
         # reshape back to (batch, num_heads, seq_len, head_dim) for attention
         queries = einops.rearrange(queries, "seq_len (batch num_heads) head_dim -> batch num_heads seq_len head_dim", batch=batch_size)
@@ -309,15 +320,22 @@ class Attention(nn.Module):
         queries = queries * scale.to(queries.dtype)
         keys = keys * scale.to(keys.dtype)
 
-        if self.use_flash2 and queries.is_cuda:
+        alibi_mask = None
+        if self.position_encoding == "alibi":
+            seq_len = queries.shape[2]
+            positions = torch.arange(seq_len, device=queries.device, dtype=torch.float32)
+            dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).clamp(min=0)
+            alibi_mask = (-self.alibi_slopes.view(1, -1, 1, 1).to(queries.device) * dist.unsqueeze(0)).to(queries.dtype)
+
+        if self.use_flash2 and queries.is_cuda and alibi_mask is None:
             try:
                 from torch.nn.attention import sdpa_kernel, SDPBackend
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
+                    attention = F.scaled_dot_product_attention(queries, keys, values, attn_mask=alibi_mask, is_causal=True)
             except Exception:
-                attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
+                attention = F.scaled_dot_product_attention(queries, keys, values, attn_mask=alibi_mask, is_causal=True)
         else:
-            attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
+            attention = F.scaled_dot_product_attention(queries, keys, values, attn_mask=alibi_mask, is_causal=True)
         concatenated = einops.rearrange(attention, "batch num_heads seq_len head_dim -> batch seq_len (num_heads head_dim)")
         final_out = self.W_out(concatenated)
 
@@ -475,7 +493,13 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
         model = DDP(model, device_ids=[config.local_rank] if torch.cuda.is_available() else None)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_batches)
+    sched_type = getattr(config, "scheduler", "cosine")
+    if sched_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_batches)
+    elif sched_type == "linear":
+        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_batches)
+    else:
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     opt_step = 0
     if getattr(config, "resume", None):

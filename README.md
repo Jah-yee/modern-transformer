@@ -87,6 +87,8 @@ uv sync --extra dev && uv run pytest tests/ -v
 ```
 
 ### Options
+- `--position_encoding rope|alibi` (default: rope)
+- `--scheduler cosine|linear|constant` (default: cosine)
 - `--grad_norm 1.0` to enable gradient clipping
 - `--qk_norm` for LLaMA-style QK RMSNorm
 - `--use_flash2` to use Flash Attention 2 on CUDA
