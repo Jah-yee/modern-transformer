@@ -31,6 +31,9 @@ A <500 line performant PyTorch pretraining implementation with:
 uv venv
 source .venv/bin/activate
 uv sync
+
+# download data (optional; default path is data/tiny_shakespeare.txt)
+uv run python scripts/download_tiny_shakespeare.py
 ```
 
 ### Logging
