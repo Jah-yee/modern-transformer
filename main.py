@@ -10,7 +10,7 @@ import time
 import sys
 
 import tiktoken
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 
 import torchinfo
 
@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--checkpoint_every", type=int, default=None, help="Save checkpoint every N optimizer steps (default: disabled)")
     parser.add_argument("--grad_norm", type=float, default=None, help="Gradient norm clipping value (default: disabled)")
     parser.add_argument("--qk_norm", action="store_true", help="Apply RMSNorm to Q/K in attention (LLaMA-style)")
+    parser.add_argument("--val_ratio", type=float, default=0.0, help="Fraction of data for validation (0 = disabled)")
+    parser.add_argument("--val_every", type=int, default=None, help="Run validation every N optimizer steps (default: disabled)")
     return parser.parse_args()
 
 
@@ -207,6 +209,8 @@ class Config:
         self.data_path = "data/tiny_shakespeare.txt"
         self.checkpoint_every = None
         self.resume = None
+        self.val_ratio = 0.0
+        self.val_every = None
 
         if args is not None:
             self.data_path = getattr(args, "data", self.data_path)
@@ -219,6 +223,8 @@ class Config:
                 self.grad_norm = True
                 self.grad_norm_value = args.grad_norm
             self.qk_norm = getattr(args, "qk_norm", False)
+            self.val_ratio = getattr(args, "val_ratio", 0.0) or 0.0
+            self.val_every = getattr(args, "val_every", None)
             assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
             self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
@@ -399,10 +405,21 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
         )
 
     dataset = TinyShakespeare(config.data_path, config.tokenizer, config.context_len)
+    val_loader = None
+    if getattr(config, "val_ratio", 0) and config.val_ratio > 0:
+        n = len(dataset)
+        n_val = max(1, int(n * config.val_ratio))
+        n_train = n - n_val
+        train_ds, val_ds = random_split(dataset, [n_train, n_val])
+        train_dataset = train_ds
+        val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
+    else:
+        train_dataset = dataset
+
     if config.world_size > 1:
-        sampler = DistributedSampler(dataset, shuffle=True)
+        sampler = DistributedSampler(train_dataset, shuffle=True)
         dataloader = DataLoader(
-            dataset,
+            train_dataset,
             batch_size=config.batch_size,
             sampler=sampler,
             num_workers=4,
@@ -411,7 +428,7 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
         )
     else:
         dataloader = DataLoader(
-            dataset,
+            train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=4,
@@ -474,6 +491,21 @@ def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_en
                         "batch_idx": batch_idx,
                     }, f"checkpoint_step_{opt_step}.pt")
                     print(f"Saved checkpoint_step_{opt_step}.pt")
+                if val_loader and getattr(config, "val_every", None) and opt_step > 0 and opt_step % config.val_every == 0 and rank == 0:
+                    raw_model = model.module if hasattr(model, "module") else model
+                    raw_model.eval()
+                    val_loss_sum, val_n = 0.0, 0
+                    with torch.no_grad():
+                        for vx, vy in val_loader:
+                            vx, vy = vx.to(config.device), vy.to(config.device)
+                            vlogits = model(vx)
+                            val_loss_sum += F.cross_entropy(vlogits.float().view(-1, config.vocab_size), vy.view(-1), reduction="sum").item()
+                            val_n += vx.numel()
+                    raw_model.train()
+                    val_loss = val_loss_sum / max(val_n, 1)
+                    if not no_wandb:
+                        wandb.log({"val_loss": val_loss, "val_perplexity": math.exp(val_loss), "val_at_step": opt_step})
+                    print(f"Val step {opt_step} loss: {val_loss:.4f} perplexity: {math.exp(val_loss):.4f}")
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = (x.shape[0] * x.shape[1]) / elapsed # batch size * sequence length = total tokens in batch
