@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,8 +23,23 @@ from torch.utils.data.distributed import DistributedSampler
 load_dotenv()
 
 WANDB_API_KEY = os.getenv("WANDB_API_KEY")
-WANDB_PROJECT = "PROJECT_NAME"
-WANDB_ENTITY = "TEAM_NAME"
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "PROJECT_NAME")
+WANDB_ENTITY = os.getenv("WANDB_ENTITY", "TEAM_NAME")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Modern Transformer pretraining")
+    parser.add_argument("--run", type=str, default=None, help="Run name for wandb")
+    parser.add_argument("--data", type=str, default="data/tiny_shakespeare.txt", help="Path to training data")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size per device")
+    parser.add_argument("--context_len", type=int, default=512, help="Context length")
+    parser.add_argument("--max_batches", type=int, default=None, help="Max batches per run")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--wandb_project", type=str, default=None, help="W&B project (overrides env)")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (overrides env)")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+    return parser.parse_args()
+
 
 # ----------------------------
 # RoPE implementation from GPT OSS release, see: https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py
@@ -123,9 +139,10 @@ class RotaryEmbedding(nn.Module):
         key = key.reshape(key_shape)
         return query, key
 
-class Config():
+class Config:
+    """Training and model config; overrides from CLI args when args is provided."""
 
-    def __init__(self):
+    def __init__(self, args=None):
         # ----------------------------
         # architecture configs
         # ----------------------------
@@ -182,6 +199,15 @@ class Config():
         assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
         self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size) # accum steps simulates larger batches
         self.max_batches = None
+        self.data_path = "data/tiny_shakespeare.txt"
+
+        if args is not None:
+            self.data_path = getattr(args, "data", self.data_path)
+            self.batch_size = getattr(args, "batch_size", self.batch_size)
+            self.context_len = getattr(args, "context_len", self.context_len)
+            self.max_batches = getattr(args, "max_batches", self.max_batches)
+            assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
+            self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
         print("# ----------------------------")
         print("using device: ", self.device)
@@ -328,7 +354,9 @@ class TinyShakespeare(Dataset):
         y = self.tokens[idx + 1:idx + self.context_len + 1]
         return x, y
 
-def training(config, run_name):
+def training(config, run_name=None, no_wandb=False, wandb_project=None, wandb_entity=None):
+    project = wandb_project if wandb_project is not None else WANDB_PROJECT
+    entity = wandb_entity if wandb_entity is not None else WANDB_ENTITY
     if config.world_size > 1:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend)
@@ -336,21 +364,21 @@ def training(config, run_name):
     else:
         rank = 0
 
-    if rank == 0:
+    if rank == 0 and not no_wandb:
         wandb.init(
-            project=WANDB_PROJECT,
-            entity=WANDB_ENTITY,
+            project=project,
+            entity=entity,
             name=run_name,
             config=vars(config)
         )
 
-    dataset = TinyShakespeare("data/tiny_shakespeare.txt", config.tokenizer, config.context_len)
+    dataset = TinyShakespeare(config.data_path, config.tokenizer, config.context_len)
     if config.world_size > 1:
         sampler = DistributedSampler(dataset, shuffle=True)
         dataloader = DataLoader(
             dataset,
-            batch_size=4,
-            sampler = sampler,
+            batch_size=config.batch_size,
+            sampler=sampler,
             num_workers=4,
             pin_memory=True,
             persistent_workers=True
@@ -358,7 +386,7 @@ def training(config, run_name):
     else:
         dataloader = DataLoader(
             dataset,
-            batch_size=4,
+            batch_size=config.batch_size,
             shuffle=True,
             num_workers=4,
             pin_memory=True,
@@ -401,9 +429,8 @@ def training(config, run_name):
             time_elapsed = time.perf_counter() - training_start_time
             
             if rank == 0:
-
-                wandb.log({"loss": loss.item() * config.accum_steps, "epoch": epoch, "batch": batch_idx, "tokens_per_sec": tokens_per_sec, "perplexity": math.exp(loss.item() * config.accum_steps), "lr": scheduler.get_last_lr()[0], "time_elapsed": time_elapsed})
-
+                if not no_wandb:
+                    wandb.log({"loss": loss.item() * config.accum_steps, "epoch": epoch, "batch": batch_idx, "tokens_per_sec": tokens_per_sec, "perplexity": math.exp(loss.item() * config.accum_steps), "lr": scheduler.get_last_lr()[0], "time_elapsed": time_elapsed})
                 if epoch == 0 and batch_idx == 0:
                     print("theoretical start loss: ", math.log(config.vocab_size))
                 if batch_idx % 1 == 0:
@@ -415,7 +442,7 @@ def training(config, run_name):
             if config.max_batches != None and batch_idx >= config.max_batches:
                 break
 
-    if rank == 0:
+    if rank == 0 and not no_wandb:
         wandb.finish()
     if config.world_size > 1:
         dist.destroy_process_group()
@@ -444,10 +471,12 @@ def inference(model, config):
         print(i + " " + config.tokenizer.decode(model(i)))
 
 if __name__ == "__main__":
-    if "--run" in sys.argv:
-        run_name = sys.argv[sys.argv.index("--run") + 1]
-    else:
-        run_name = None
-
-    config = Config()
-    training(config, run_name)
+    args = parse_args()
+    config = Config(args)
+    training(
+        config,
+        run_name=args.run,
+        no_wandb=args.no_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+    )
