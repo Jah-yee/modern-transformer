@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--val_every", type=int, default=None, help="Run validation every N optimizer steps (default: disabled)")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "count_params", "inference"], help="Mode: train, count_params, or inference")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint (required for inference)")
+    parser.add_argument("--use_flash2", action="store_true", help="Use Flash Attention 2 backend for SDPA when available (CUDA)")
     return parser.parse_args()
 
 
@@ -188,6 +189,7 @@ class Config:
         self.grad_norm = False
         self.grad_norm_value = 1.0
         self.qk_norm = False
+        self.use_flash2 = False
 
         # ----------------------------
         # data configs
@@ -227,6 +229,7 @@ class Config:
             self.qk_norm = getattr(args, "qk_norm", False)
             self.val_ratio = getattr(args, "val_ratio", 0.0) or 0.0
             self.val_every = getattr(args, "val_every", None)
+            self.use_flash2 = getattr(args, "use_flash2", False)
             assert self.target_batch_size % self.batch_size == 0, f"target_batch_size ({self.target_batch_size}) must be divisible by batch_size ({self.batch_size})"
             self.accum_steps = self.target_batch_size / (self.batch_size * self.world_size)
 
@@ -258,6 +261,7 @@ class Attention(nn.Module):
 
         self.qk_norm = getattr(config, "qk_norm", False)
         self.qk_norm_layer = nn.RMSNorm(self.attention_dim, eps=1e-6) if self.qk_norm else None
+        self.use_flash2 = getattr(config, "use_flash2", False)
         self.rope = RotaryEmbedding(
             head_dim=self.attention_dim,
             base=config.rope_theta,
@@ -294,10 +298,15 @@ class Attention(nn.Module):
         queries = queries * scale.to(queries.dtype)
         keys = keys * scale.to(keys.dtype)
 
-        attention = F.scaled_dot_product_attention(
-            queries, keys, values,
-            is_causal=True,
-        )
+        if self.use_flash2 and queries.is_cuda:
+            try:
+                from torch.nn.attention import sdpa_kernel, SDPBackend
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
+            except Exception:
+                attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
+        else:
+            attention = F.scaled_dot_product_attention(queries, keys, values, is_causal=True)
         concatenated = einops.rearrange(attention, "batch num_heads seq_len head_dim -> batch seq_len (num_heads head_dim)")
         final_out = self.W_out(concatenated)
 
